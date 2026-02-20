@@ -7,6 +7,7 @@ import com.beyond.order_system.ordering.dto.request.OrderItemCreateReqDto;
 import com.beyond.order_system.ordering.dto.response.ProductResDto;
 import com.beyond.order_system.ordering.dto.response.MyOrdersResDto;
 import com.beyond.order_system.ordering.dto.response.OrderListResDto;
+import com.beyond.order_system.ordering.feignClients.ProductFeignClient;
 import com.beyond.order_system.ordering.repository.OrderingDetailRepository;
 import com.beyond.order_system.ordering.repository.OrderingRepository;
 import com.beyond.order_system.ordering.domain.OrderingDetails;
@@ -31,13 +32,15 @@ public class OrderingService {
     private final OrderingRepository orderingRepository;
     private final OrderingDetailRepository orderingDetailRepository;
     private final RestTemplate restTemplate;
+    private final ProductFeignClient productFeignClient;
 
     @Autowired
     public OrderingService(OrderingRepository orderingRepository,
-                           OrderingDetailRepository orderingDetailRepository, RestTemplate restTemplate) {
+                           OrderingDetailRepository orderingDetailRepository, RestTemplate restTemplate, ProductFeignClient productFeignClient) {
         this.orderingRepository = orderingRepository;
         this.orderingDetailRepository = orderingDetailRepository;
         this.restTemplate = restTemplate;
+        this.productFeignClient = productFeignClient;
     }
 
     public Long create(List<OrderItemCreateReqDto> items, String email) {
@@ -59,7 +62,7 @@ public class OrderingService {
             ResponseEntity<ProductResDto> responseEntity = restTemplate.exchange(productStockEndPoint, HttpMethod.GET, productStockHttpEntity, ProductResDto.class);
 
             ProductResDto product = responseEntity.getBody();
-            if(product.getStockQuantity() < itemDto.getProductCount()){
+            if (product.getStockQuantity() < itemDto.getProductCount()) {
                 throw new IllegalArgumentException("재고가 부족합니다.");
             }
 
@@ -79,6 +82,39 @@ public class OrderingService {
             HttpEntity<OrderItemCreateReqDto> productStockDecreaseHttpEntity = new HttpEntity<>(itemDto, productStockDecreaseHeaders);
             // 이 때 재고 감소 요청 중 에러가 발생하면 전체 롤백이 될것이다
             restTemplate.exchange(productStockDecreaseEndPoint, HttpMethod.PUT, productStockDecreaseHttpEntity, Void.class);
+        }
+
+        return order.getId();
+    }
+
+    // restTemplate -> openfeign client 개선
+    public Long createFeign(List<OrderItemCreateReqDto> items, String email) {
+        Ordering order = Ordering.builder()
+                .memberEmail(email)
+                .orderStatus(OrderStatus.ORDERED)
+                .build();
+
+        orderingRepository.save(order);
+
+        for (OrderItemCreateReqDto itemDto : items) {
+            // (1) 재고 조회 요청 (동기요청: HTTP요청)
+            ProductResDto product = productFeignClient.getProductById(itemDto.getProductId());
+
+            if (product.getStockQuantity() < itemDto.getProductCount()) {
+                throw new IllegalArgumentException("재고가 부족합니다.");
+            }
+
+            // (2) 주문 발생
+            OrderingDetails orderingDetails = OrderingDetails.builder()
+                    .ordering(order)
+                    .productId(itemDto.getProductId())
+                    .productName(product.getName())
+                    .quantity(itemDto.getProductCount())
+                    .build();
+            orderingDetailRepository.save(orderingDetails);
+
+            // (3) 재고 감소 요청 (동기/비동기요청 모두 가능, 동기: HTTP요청 기반, 비동기: 이벤트 메시지 기반)
+            productFeignClient.decreaseStockQuantity(itemDto);
         }
 
         return order.getId();

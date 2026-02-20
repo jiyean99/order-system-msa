@@ -38,6 +38,9 @@ dependencies {
 
     // 마이크로서비스
     implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-client'  // Eureka 서비스 등록/발견
+
+    // msa간에 통신을 위한 openfeign 의존성 추가
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
 }
 
 dependencyManagement{
