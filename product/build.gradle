@@ -39,6 +39,9 @@ dependencies {
 
     // 마이크로서비스
     implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-client'  // Eureka 서비스 등록/발견
+
+    // 재고감소 비동기처리를 위한 kafka관련 의존성추가
+    implementation 'org.springframework.kafka:spring-kafka'
 }
 
 dependencyManagement{

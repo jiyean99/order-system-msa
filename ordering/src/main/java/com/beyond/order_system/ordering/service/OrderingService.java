@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.http.*;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,14 +34,16 @@ public class OrderingService {
     private final OrderingDetailRepository orderingDetailRepository;
     private final RestTemplate restTemplate;
     private final ProductFeignClient productFeignClient;
+    private final KafkaTemplate kafkaTemplate;
 
     @Autowired
     public OrderingService(OrderingRepository orderingRepository,
-                           OrderingDetailRepository orderingDetailRepository, RestTemplate restTemplate, ProductFeignClient productFeignClient) {
+                           OrderingDetailRepository orderingDetailRepository, RestTemplate restTemplate, ProductFeignClient productFeignClient, KafkaTemplate kafkaTemplate) {
         this.orderingRepository = orderingRepository;
         this.orderingDetailRepository = orderingDetailRepository;
         this.restTemplate = restTemplate;
         this.productFeignClient = productFeignClient;
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     public Long create(List<OrderItemCreateReqDto> items, String email) {
@@ -114,7 +117,11 @@ public class OrderingService {
             orderingDetailRepository.save(orderingDetails);
 
             // (3) 재고 감소 요청 (동기/비동기요청 모두 가능, 동기: HTTP요청 기반, 비동기: 이벤트 메시지 기반)
-            productFeignClient.decreaseStockQuantity(itemDto);
+            // (3-1) 동기 요청 로직
+            // productFeignClient.decreaseStockQuantity(itemDto);
+
+            // (3-2) 비동기 로직 : kafkaTemplate를 통해 메시지 발행
+            kafkaTemplate.send("stock-decrease-topic", itemDto);
         }
 
         return order.getId();
