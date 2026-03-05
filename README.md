@@ -1,251 +1,256 @@
-# 보상 트랜잭션 기반 데이터 정합성 보장 설계
+# Order System MSA – Saga 기반 보상 트랜잭션 설계
 
-## 1. 프로젝트 개요
+## 프로젝트 개요
+이 프로젝트는 <b>모놀리식 주문 시스템을 MSA(Microservice Architecture)</b>로 리팩토링하고,  
+서비스 간 데이터 정합성을 보장하기 위해 <b>Kafka 기반 Saga 패턴(보상 트랜잭션)</b>을 적용한 주문 처리 시스템입니다.
 
-분산 트랜잭션 환경에서 일부 작업 실패 시  
-선행 작업이 커밋되어 데이터 정합성이 깨지는 문제를 해결하기 위해  
-보상 트랜잭션 기반의 롤백 전략을 설계했다.
+최종 목표는 서비스 간 강결합 없이, 장애 상황에서도 데이터 일관성을 유지하며  
+확장성과 복원력을 갖춘 분산 아키텍처를 설계하는 것입니다.
 
----
+### 주요 목표
+- 서비스 간 <b>강결합 제거</b>
+- <b>동기 트랜잭션 한계</b>(지연, 실패 전파) 해결
+- <b>장애 상황</b>에서도 데이터 정합성 보장
+- <b>이벤트 중심 아키텍처(Event-Driven)</b> 기반의 확장성 확보
 
-## 2. 문제 정의
+***
 
-### 2.1 기존 구조
+## 아키텍처 구성
 
-하나의 요청에서 다음과 같은 작업이 순차적으로 실행되는 구조였다.
+### 마이크로서비스
+| 서비스 명 | 주요 역할 |
+|------------|------------|
+| <b>api-gateway</b> | 외부 요청 라우팅, JWT 인증 수행 |
+| <b>eureka</b> | 서비스 디스커버리 및 로드밸런싱 관리 |
+| <b>member-service</b> | 회원 정보 및 인증 관리 |
+| <b>product-service</b> | 상품 정보 및 재고 관리 |
+| <b>ordering-service</b> | 주문 생성, 상태 변경, 보상 트랜잭션 수행 |
 
-1. 주문 생성
-2. 포인트 차감
-3. 쿠폰 사용
-4. 메시지 발행
+### 인프라 구성
+| 구성 요소 | 역할 |
+|------------|------|
+| <b>Kafka (KRaft)</b> | 이벤트 브로커, 서비스 간 비동기 통신 |
+| <b>MariaDB</b> | 서비스별 데이터 저장소 |
+| <b>Redis</b> | 세션 캐시 및 임시 데이터 저장 |
+| <b>Docker Compose</b> | 로컬 개발 환경 컨테이너 오케스트레이션 |
 
-각 작업은 개별 트랜잭션으로 커밋되며  
-후행 작업 실패 시 이전 작업을 롤백할 수 없는 구조였다.
+***
 
----
+## 시스템 아키텍처 다이어그램
 
-### 2.2 실제 장애 상황
-
-주문 생성 이후 포인트 차감 실패
-
-→ 주문은 생성되었지만 포인트는 유지됨  
-→ 데이터 정합성 붕괴  
-→ 수동 데이터 보정 필요
-
----
-
-### 2.3 기존 방식의 한계
-
-- DB 트랜잭션으로는 이미 커밋된 작업 롤백 불가능
-- 장애 대응을 위한 운영 개입 필요
-- 재처리 시 중복 실행 발생
-
----
-
-## 3. 목표
-
-- 데이터 정합성 보장
-- 장애 발생 시 자동 복구
-- 재처리 가능 구조 설계
-- 멱등성 보장
-
----
-
-## 4. 설계 전략
-
-### 4.1 보상 트랜잭션 패턴 적용
-
-각 작업을 다음과 같이 정의했다.
-
-| Step | Action | Compensation |
-|------|--------|--------------|
-Order | 주문 생성 | 주문 취소 |
-Point | 포인트 차감 | 포인트 복구 |
-Coupon | 쿠폰 사용 | 쿠폰 복원 |
-
-실패 발생 시 성공한 Step을 역순으로 보상 실행하도록 구성했다.
-
----
-
-### 4.2 상태 기반 트랜잭션 관리
-
-각 Step의 상태를 저장하도록 설계했다.
-
-```
-READY → SUCCESS → FAILED → COMPENSATED
+```mermaid
+flowchart LR
+    A[Client] -->|JWT Token 요청| B[API Gateway]
+    B -->|Service Discovery| C[Eureka]
+    B --> D[Ordering Service]
+    D -->|OrderCreated Event| E[(Kafka)]
+    E --> F[Product Service]
+    F -->|StockUpdated Event| E
+    E -->|Consume Event| D
+    D -->|State Update| G[(MariaDB)]
+    F -->|Update Stock| H[(MariaDB)]
+    D -->|Cache Management| I[(Redis)]
 ```
 
-이를 통해
+***
 
-- 재시도 가능
-- 중복 실행 방지
-- 장애 복구 자동화
+## 주문 처리 플로우
 
-를 달성했다.
+### 성공 시 플로우
+1. `ordering-service`에서 주문 생성 (`status = PENDING`)  
+2. 재고 차감 이벤트(`ORDER_CREATED`)를 Kafka로 발행  
+3. `product-service`가 이벤트 수신 후 재고를 차감  
+4. 재고 차감 성공 시 `ORDER_SUCCESS` 이벤트 발행  
+5. `ordering-service`가 성공 이벤트를 수신 후 상태를 `COMPLETE`로 변경  
 
----
+### 재고 부족 시 플로우
+1. 주문 생성 (`status = PENDING`)  
+2. 재고 차감 이벤트(`ORDER_CREATED`) 발행  
+3. `product-service`에서 재고 부족으로 실패 처리  
+4. `ORDER_FAIL` 이벤트 발행  
+5. `ordering-service`가 이벤트 수신 후 주문 상태를 `CANCEL`로 변경 (보상 트랜잭션 수행)  
 
-### 4.3 트랜잭션 오케스트레이션
-
-Application Layer에서 전체 흐름을 제어하도록 구성했다.
-
+### 주문 상태 전이
 ```
-executeStep()
-↓
-상태 저장
-↓
-실패 발생
-↓
-완료된 Step 조회
-↓
-보상 트랜잭션 실행
+CREATE → PENDING → COMPLETE
+            ↘ CANCEL
 ```
 
----
+***
 
-## 5. 기술적 의사결정
+## Saga 패턴 적용 이유
+MSA 환경에서는 하나의 트랜잭션으로 여러 서비스의 작업을 묶기 어려우며,  
+2PC(2-Phase Commit) 방식은 성능 저하와 복잡도를 초래합니다.  
+따라서 <b>이벤트 기반 보상 트랜잭션(Saga Pattern)</b>을 통해 다음을 달성했습니다.
 
-### 5.1 Choreography 대신 Orchestration 선택 이유
+- 서비스별 독립성 확보  
+- 장애 시 롤백 대신 <b>보상 트랜잭션(Compensation Transaction)</b> 수행  
+- <b>최종 일관성(Eventual Consistency)</b> 기반 데이터 정합성 유지  
 
-Choreography 방식은
+***
 
-- 흐름 파악이 어렵고
-- 장애 추적이 복잡
+## 서비스별 역할
 
-하다는 단점이 있어  
-중앙에서 제어 가능한 Orchestration 방식을 선택했다.
+### ordering-service
+- 주문 생성 및 Kafka 이벤트 발행 (`ORDER_CREATED`)  
+- `ORDER_SUCCESS`, `ORDER_FAIL` 이벤트 수신  
+- 주문 상태 변경 (`COMPLETE`, `CANCEL`)  
+- 보상 트랜잭션 수행 (주문 취소 시 상태 롤백 처리)  
 
----
+### product-service
+- Kafka 이벤트 수신 후 재고 차감 수행  
+- 재고 부족 시 `ORDER_FAIL`, 성공 시 `ORDER_SUCCESS` 이벤트 발행  
+- `orderId + productId` 기준으로 멱등성(Idempotency) 처리  
+- 처리 결과 로그 기록 및 모니터링  
 
-### 5.2 상태 저장 위치
+***
 
-DB에 저장하도록 설계
+## 인증 처리 전략
+- <b>Gateway (Spring Cloud Gateway)</b>에서만 JWT 검증 수행  
+- 검증 완료된 사용자 정보를 <b>Header</b>에 포함해 내부 서비스로 전달  
+- 내부 서비스는 <b>Private Network</b> 내부에서만 접근 가능  
+- 외부 요청은 반드시 Gateway를 통해야 하며, 직접 호출 차단  
 
-이유:
+***
 
-- 장애 복구 시점에도 상태 유지
-- 운영 환경에서 추적 가능
+## 트러블슈팅 및 해결 과정
 
----
+### 1. 동기 호출로 인한 서비스 강결합
+<b>문제:</b> 주문 생성 시 `product-service`를 동기 호출 → 장애 전파  
+<b>해결:</b> Kafka 기반 비동기 이벤트 전송 구조로 전환 및 Saga 도입  
+<b>효과:</b> 장애 격리, 처리 지연 감소, 서비스 확장 용이  
 
-## 6. 트랜잭션 흐름
+### 2. 재고 차감 실패 시 데이터 정합성 문제
+<b>문제:</b> 주문 생성 성공 후 재고 차감 실패 시 상태 불일치  
+<b>해결:</b> 실패 이벤트 수신 시 주문 상태를 `CANCEL` 처리  
+<b>효과:</b> 분산 환경에서도 데이터 정합성 유지  
 
-### 정상 흐름
+### 3. Kafka 중복 메시지 소비로 인한 재고 중복 차감
+<b>문제:</b> Kafka는 `at-least-once` 방식으로 동작하여 중복 이벤트 발생 가능  
+<b>해결:</b> `orderId + productId` 기반 멱등성 로직 적용  
+<b>효과:</b> 중복 처리 방지, 재고 정합성 유지  
 
-1. 주문 생성 SUCCESS
-2. 포인트 차감 SUCCESS
-3. 쿠폰 사용 SUCCESS
+### 4. Gateway를 우회한 직접 접근
+<b>문제:</b> 외부에서 내부 API 직접 접근 가능  
+<b>해결:</b> 내부 서비스는 Private Subnet에서만 접근 허용, Gateway만 Public으로 노출  
+<b>효과:</b> 인증 우회 차단, 네트워크 레벨 보안 강화  
 
----
+### 5. 서비스 확장 시 포트 충돌
+<b>문제:</b> 서비스 인스턴스 확장 시 포트 충돌 발생  
+<b>해결:</b> `server.port=0` 설정 → 동적 포트 할당, Eureka 기반 로드밸런싱 적용  
+<b>효과:</b> 인스턴스 단위 확장성 확보  
 
-### 실패 흐름
+***
 
-포인트 차감 실패
+## 이벤트 메시지 예시
 
-→ 주문 생성 COMPENSATE 실행
-
----
-
-## 7. 트러블슈팅
-
-### 7.1 보상 트랜잭션 중복 실행
-
-#### 문제
-
-네트워크 타임아웃 이후 재시도 과정에서  
-보상 로직이 중복 실행됨.
-
-#### 분석
-
-로그 분석 결과
-
-- 동일한 Step에 대해 두 번의 보상 요청 발생
-- 상태 검증 로직 부재
-
-#### 해결
-
-보상 실행 전 상태 검증
-
-```
-if (stepStatus != SUCCESS) return;
-```
-
-멱등성 보장.
-
----
-
-### 7.2 재처리 시 중복 실행
-
-#### 문제
-
-장애 복구 후 재시도 시  
-이미 성공한 Step이 다시 실행됨.
-
-#### 해결
-
-상태 기반 실행 분기 처리
-
-```
-if (stepStatus == SUCCESS) skip;
+### 주문 생성 이벤트 (`ORDER_CREATED`)
+```json
+{
+  "eventType": "ORDER_CREATED",
+  "orderId": 1023,
+  "memberId": 7,
+  "productId": 31,
+  "quantity": 2,
+  "timestamp": "2026-03-05T15:20:00Z"
+}
 ```
 
----
+### 재고 차감 성공 이벤트 (`ORDER_SUCCESS`)
+```json
+{
+  "eventType": "ORDER_SUCCESS",
+  "orderId": 1023,
+  "productId": 31,
+  "remainingStock": 98,
+  "timestamp": "2026-03-05T15:20:03Z"
+}
+```
 
-### 7.3 보상 순서 문제
+### 재고 차감 실패 이벤트 (`ORDER_FAIL`)
+```json
+{
+  "eventType": "ORDER_FAIL",
+  "orderId": 1023,
+  "productId": 31,
+  "reason": "재고 부족",
+  "timestamp": "2026-03-05T15:20:02Z"
+}
+```
 
-#### 문제
+***
 
-보상이 실행될 때 실행 순서가 보장되지 않아  
-데이터 무결성이 깨짐.
+## API 사용 예시
 
-#### 해결
+### 주문 생성 요청
+<b>POST /api/orders</b>
 
-- 완료된 Step을 Stack 구조로 관리
-- LIFO 방식으로 보상 실행
+#### Request
+```json
+{
+  "memberId": 7,
+  "productId": 31,
+  "quantity": 2
+}
+```
 
----
+#### Response
+```json
+{
+  "orderId": 1023,
+  "status": "PENDING",
+  "message": "Order successfully created. Awaiting stock confirmation."
+}
+```
 
-## 8. 성과
+### 주문 상태 조회
+<b>GET /api/orders/{orderId}</b>
 
-- 데이터 정합성 보장
-- 수동 복구 제거
-- 장애 대응 시간 단축
-- 재처리 자동화
+#### Response
+```json
+{
+  "orderId": 1023,
+  "memberId": 7,
+  "productId": 31,
+  "status": "COMPLETE"
+}
+```
 
----
+***
 
-## 9. 아키텍처
+## 기술 스택
+- <b>Backend Framework:</b> Spring Boot  
+- <b>API Gateway:</b> Spring Cloud Gateway  
+- <b>Service Discovery:</b> Eureka  
+- <b>Message Broker:</b> Kafka (KRaft)  
+- <b>Database:</b> MariaDB  
+- <b>Cache:</b> Redis  
+- <b>Communication:</b> OpenFeign  
+- <b>Persistence:</b> Spring Data JPA  
+- <b>Container:</b> Docker Compose  
 
-### Layered Architecture
+***
 
-- Application Layer  
-  트랜잭션 흐름 제어
+## 실행 방법
 
-- Domain Layer  
-  Step 및 보상 로직
+```bash
+# 1. 인프라 실행
+docker-compose up -d
 
-- Infrastructure Layer  
-  상태 저장 및 조회
+# 2. Spring Boot 애플리케이션 실행 순서
+# 반드시 Eureka → Gateway → Member → Product → Ordering 순으로 실행
+1. eureka
+2. api-gateway
+3. member-service
+4. product-service
+5. ordering-service
+```
 
----
+***
 
-## 10. 한계 및 개선 방향
-
-### 현재 한계
-
-- 단일 서비스 기준 설계
-- 메시지 브로커 기반 이벤트 처리 미적용
-
-### 개선 방향
-
-- Saga 패턴 적용
-- Kafka 기반 이벤트 드리븐 구조 전환
-- 분산 환경에서의 최종 일관성 보장
-
----
-
-## 11. 배운 점
-
-- 분산 환경에서 ACID만으로는 정합성을 보장할 수 없다.
-- 보상 트랜잭션의 핵심은 멱등성이다.
-- 상태 기반 설계는 장애 대응력을 크게 향상시킨다.
+## 프로젝트 회고
+- <b>동기식 구조 → 이벤트 기반 구조 전환</b>을 통해 MSA의 장단점을 체감  
+- <b>Saga 패턴</b>을 직접 설계하며 “보상 트랜잭션”의 개념을 명확히 이해  
+- 장애 상황 및 메시지 중복 등 현실적인 문제를 경험하고 해결  
+- <b>즉각적 일관성보다 최종 일관성(Eventual Consistency)</b>이 요구되는 MSA 철학 확립  
+- 결과적으로 서비스 간 결합도를 낮춘, 복원력 있는 주문 처리 구조 완성  
